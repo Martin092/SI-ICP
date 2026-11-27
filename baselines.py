@@ -27,8 +27,8 @@ class CausalDiscoveryObservational:
         self.X = X 
         self.Y = Y
 
-        self.model_x_to_y = None 
-        self.model_y_to_x = None 
+        self.model_null = None 
+        self.model_alt = None 
 
         self.significance_level = significance_level
 
@@ -44,20 +44,20 @@ class NonLinearNoise(CausalDiscoveryObservational):
         self.name = "Non-Linear Noise"
 
     def run(self):
-        x_to_y = LinearRegression()
-        y_to_x = LinearRegression()
+        model_null = LinearRegression()
+        model_alt = LinearRegression()
 
-        self.model_x_to_y = x_to_y 
-        self.model_y_to_x = y_to_x
+        self.model_null = model_null 
+        self.model_alt = model_alt
 
         X = self.X 
         Y = self.Y 
     
-        x_to_y.fit(X, Y)
-        y_to_x.fit(Y, X)
+        model_null.fit(X, Y)
+        model_alt.fit(Y, X)
     
-        res_x_to_y = x_to_y.predict(X) - Y
-        res_y_to_x = y_to_x.predict(Y) - X  
+        res_x_to_y = model_null.predict(X) - Y
+        res_y_to_x = model_alt.predict(Y) - X  
     
         stat, pval_x_to_y = Hsic().test(res_x_to_y, X)
         stat, pval_y_to_x = Hsic().test(res_y_to_x, Y)
@@ -96,17 +96,17 @@ class SI_ICP(CausalDiscoveryInterventional):
         pval = 1-(residuals_faulty > residuals_normal).mean()
 
         if x_to_y:
-            self.model_x_to_y = model 
+            self.model_null = model 
         else: 
-            self.model_y_to_x = model 
+            self.model_alt = model 
 
         return pval
 
     def run(self):
-        pval_x_to_y = self._one_direction(x_to_y=True)
-        pval_y_to_x = self._one_direction(x_to_y=False)
+        pval_null = self._one_direction(x_to_y=True)
+        pval_alt = self._one_direction(x_to_y=False)
     
-        return pval_x_to_y > pval_y_to_x, pval_x_to_y, pval_y_to_x
+        return pval_null > pval_alt, pval_null, pval_alt
 
 class SI_ICP_Gaussian_Residuals(CausalDiscoveryInterventional):
     def __init__(self, X, Y, faulty_x, faulty_y, significance_level=0.1):
@@ -135,18 +135,18 @@ class SI_ICP_Gaussian_Residuals(CausalDiscoveryInterventional):
         pval = normal_pdf(faulty_residual.flatten()[0], mean, var)
 
         if x_to_y:
-            self.model_x_to_y = model 
+            self.model_null = model 
         else: 
-            self.model_y_to_x = model
+            self.model_alt = model
 
         return pval
 
     def run(self):
-        pval_x_to_y = self._one_direction(x_to_y=True)
-        pval_y_to_x = self._one_direction(x_to_y=False)
+        pval_null = self._one_direction(x_to_y=True)
+        pval_alt = self._one_direction(x_to_y=False)
 
 
-        return pval_x_to_y > pval_y_to_x, pval_x_to_y, pval_y_to_x
+        return pval_null > pval_alt, pval_null, pval_alt
     
 
 class SI_ICP_Gaussian_Residuals_Fraction(CausalDiscoveryInterventional):

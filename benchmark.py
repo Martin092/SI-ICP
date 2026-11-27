@@ -6,6 +6,97 @@ import numpy as np
 
 from baselines import NonLinearNoise, SI_ICP, SI_ICP_Gaussian_Residuals, SI_ICP_Gaussian_Residuals_Fraction
 
+class ExperimentLogger:
+    '''
+    Schema:
+    {
+        "meta": {
+            "name": "...",
+            "benchmark": "observational",
+            "trials": 100,
+            "size": [100, 1],
+            "causal_model": {"name": "LinearAdditiveModel", "slope": 2, "intercept": 0}
+        },
+        "settings": [
+            {
+                "setting": 0,
+                "x_distribution": "Normal(0, 1)",
+                "noise_distribution": "Normal(0, 1)",
+                "n_trials": 100,
+                "success_rate": {"x->y": 0.95, "y->x": 0.62},
+                "trials": [
+                    {
+                        "trial": 0,
+                        "results": {
+                            "x->y": {
+                                "rejected_null": false,
+                                "expected_reject": false,
+                                "correct": true,
+                                "p_null": 0.41,
+                                "p_alt": 0.002,
+                                "model_null": {"slope": [0.98], "intercept": 0.01},
+                                "model_alt": null
+                            },
+                            "y->x": {...}
+                        },
+                        "data": {"x": [...], "y": [...], "noises": [...], "x_f": ..., "y_f": ...}
+                    }
+                ]
+            }
+        ]
+    }
+    '''
+    def __init__(self, meta=None):
+        self.meta = meta or {}
+        self._settings = {}  # setting index -> {"info": {...}, "trials": [...]}
+
+    def add(self, rec):
+        s = self._settings.setdefault(rec["setting"], {
+            "info": {
+                "setting": rec["setting"],
+                "x_distribution": rec["x_name"],
+                "noise_distribution": rec["noise_name"],
+            },
+            "trials": [],
+        })
+        s["trials"].append({
+            "trial": rec["trial"],
+            "results": rec["results"],
+            "data": {k: rec[k] for k in ("x", "y", "noises", "x_f", "y_f") if k in rec},
+        })
+
+    def to_dict(self):
+        settings = []
+        for s in self._settings.values():
+            n = len(s["trials"])
+            rates = {
+                d: sum(t["results"][d]["correct"] for t in s["trials"]) / n
+                for d in ("x->y", "y->x")
+            }
+            settings.append({**s["info"], "n_trials": n, "success_rate": rates, "trials": s["trials"]})
+        return {"meta": self.meta, "settings": settings}
+
+    def summary(self):
+        return {
+            f"{s['x_distribution']} | {s['noise_distribution']}": s["success_rate"]
+            for s in self.to_dict()["settings"]
+        }
+
+    def save(self, path):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(self.to_dict(), f, indent=2, default=self._to_jsonable)
+
+    @staticmethod
+    def _to_jsonable(v):
+        if isinstance(v, np.ndarray):
+            return v.tolist()
+        if isinstance(v, np.generic):
+            return v.item()
+        return str(v)
+
+    
 class Noise():
     def __init__(self):
         self.name = "UNNAMED NOISE DISTRIBUTION_" + str(np.random.rand())
@@ -60,9 +151,12 @@ class LinearAdditiveModel():
     def __init__(self, slope, intercept):
         self.slope = slope 
         self.intercept = intercept 
+        self.name = "LinearAdditiveModel"
 
     def compute(self, xs, noises):
         return self.slope * xs + self.intercept + noises
+    
+    
 
     def json(self):
         return {
@@ -103,76 +197,80 @@ class Benchmark:
     def run(self):
         assert len(self.x_distributions) == len(self.noise)
 
-        
-        for i in range(len(self.x_distributions)):
-            x_distr = self.x_distributions[i]
-            noise_distr = self.noise[i]
-            
-            key_trial = f"{x_distr.name} {noise_distr.name} success"
-            self.log['trials'][key_trial] = 0
-
-            key_data = f"{x_distr.name} {noise_distr.name} data"
-            self.log[key_data] = dict() 
-            self.log[key_data]['distr_name'] = f"{x_distr.name}; {noise_distr.name}"
-            
+        for i, (x_distr, noise_distr) in enumerate(zip(self.x_distributions, self.noise)):
             for k in range(self.trials):
-                xs = x_distr.sample(self.size) 
-                noises = noise_distr.sample(self.size) 
+                xs = x_distr.sample(self.size)
+                noises = noise_distr.sample(self.size)
+                ys = self.causal_model.compute(xs, noises)
 
-                ys = self.causal_model.compute(xs, noises) 
+                record = {
+                    "setting": i,
+                    "x_name": x_distr.name,
+                    "noise_name": noise_distr.name,
+                    "trial": k,
+                    "x": xs,
+                    "y": ys,
+                    "noises": noises,
+                }
 
-                self.log[key_data][k] = dict()
-                self.log[key_data][k]["x"] = xs 
-                self.log[key_data][k]["y"] = ys 
-                self.log[key_data][k]["noises"] = noises 
-
-                discovery_alg = None 
                 if self.benchmark_id == "interventional":
                     x_f, y_f = self._interventional_samples(i)
+                    record["x_f"], record["y_f"] = x_f, y_f
 
-                    self.log[key_data][k]["x_f"] = x_f 
-                    self.log[key_data][k]["y_f"] = y_f
-
-                    discovery_alg = self.method(xs, ys, x_f, y_f)
+                    alg_yx = self.method(ys, xs, y_f, x_f)
+                    alg_xy = self.method(xs, ys, x_f, y_f)
                 elif self.benchmark_id == "observational":
-                    discovery_alg = self.method(xs, ys)
+                    alg_yx = self.method(ys, xs)
+                    alg_xy = self.method(xs, ys)
+                else:
+                    raise ValueError(f"Unknown benchmark_id: {self.benchmark_id}")
 
-                is_correct, pval_x_to_y, pval_y_to_x = discovery_alg.run()
+                record["results"] = {
+                    "x->y": self._run_direction(alg_xy, expected_reject=False),
+                    "y->x": self._run_direction(alg_yx, expected_reject=True),
+                }
+                yield record
 
-                self.log[key_data][k]['pval_x_to_y'] = pval_x_to_y 
-                self.log[key_data][k]['pval_y_to_x'] = pval_y_to_x 
+    @staticmethod
+    def _run_direction(alg, expected_reject):
+        # ASSUMPTION: the first return value of alg.run() means "null was rejected".
+        # If it means the opposite, change this one line.
+        rejected_null, p_null, p_alt = alg.run()
+        return {
+            "rejected_null": bool(rejected_null),
+            "expected_reject": expected_reject,
+            "correct": bool(rejected_null) == expected_reject,
+            "p_null": p_null,
+            "p_alt": p_alt,
+            # fits are logged in the frame the test ran in (no inversion)
+            "model_null": Benchmark._fit_summary(alg.model_null),
+            "model_alt": Benchmark._fit_summary(alg.model_alt),
+        }
 
-                if discovery_alg.model_x_to_y is not None:
-                    self.log[key_data][k]['x_to_y_model'] = {
-                        "slope": discovery_alg.model_x_to_y.coef_,
-                        "intercept": discovery_alg.model_x_to_y.intercept_
-                    }
+    @staticmethod
+    def _fit_summary(model):
+        if model is None:
+            return None
+        return {"slope": model.coef_, "intercept": model.intercept_}
 
-                if discovery_alg.model_y_to_x is not None:
-                    self.log[key_data][k]['y_to_x_model'] = {
-                        "slope": discovery_alg.model_y_to_x.coef_,
-                        "intercept": discovery_alg.model_y_to_x.intercept_
-                    }
-                
-                self.log[key_data][k]["correct"] = is_correct
+    def run_and_log(self):
+        logger = ExperimentLogger(meta={
+            "name": self.name,
+            "benchmark": self.benchmark_id,
+            "trials": self.trials,
+            "size": self.size,
+            "causal_model": {
+                "name": self.causal_model.name,
+                "slope": self.causal_model.slope,
+                "intercept": self.causal_model.intercept
+            }
+        })
+        for record in self.run():
+            logger.add(record)
 
-                if is_correct: self.log['trials'][key_trial] += 1
-
-            self.log['trials'][key_trial] /= self.trials
-
-        print(self.log['trials'])
-
-        results_dir = Path("results") / self.name
-        results_dir.mkdir(parents=True, exist_ok=True)
-        with (results_dir / "log.json").open("w", encoding="utf-8") as log_file:
-            json.dump(
-                self.log,
-                log_file,
-                indent=2,
-                default=lambda value: value.tolist() if isinstance(value, np.ndarray)
-                else value.item() if isinstance(value, np.generic)
-                else str(value),
-            )
+        print(logger.summary())
+        logger.save(Path("results") / self.name / "log.json")
+        return logger.to_dict()
 
 
 class ObservationalBenchmark(Benchmark):
@@ -238,14 +336,15 @@ causal_model = LinearAdditiveModel(2, 0)
 interventional_distr = [Point(5)] * len(distr_noise)
 interventional_noise = [Point(0)] * len(distr_noise)
 
-# ObservationalBenchmark(
-#     distr,
-#     distr_noise, 
-#     causal_model,
-#     NonLinearNoise,
-#     name="non_linear",
-#     trials=1000
-# ).run()
+ObservationalBenchmark(
+    distr,
+    distr_noise, 
+    causal_model,
+    NonLinearNoise,
+    name="non_gaussian_noise",
+    trials=10
+).run_and_log()
+
 
 # InterventionalBenchmark(
 #     distr, 
@@ -256,7 +355,7 @@ interventional_noise = [Point(0)] * len(distr_noise)
 #     interventional_noise,
 #     name="SI_ICP",
 #     trials=1000
-# ).run()
+# ).run_and_log()
 
 
 # InterventionalBenchmark(
@@ -268,17 +367,17 @@ interventional_noise = [Point(0)] * len(distr_noise)
 #     interventional_noise,
 #     name="SI_ICP_GAUSSIAN",
 #     trials=1000
-# ).run()
+# ).run_and_log()
 
-InterventionalBenchmark(
-    distr, 
-    distr_noise,
-    causal_model, 
-    SI_ICP_Gaussian_Residuals_Fraction, 
-    interventional_distr,
-    interventional_noise,
-    name="SI_ICP_F_TEST",
-    trials=1000
-).run()
+# InterventionalBenchmark(
+#     distr, 
+#     distr_noise,
+#     causal_model, 
+#     SI_ICP_Gaussian_Residuals_Fraction, 
+#     interventional_distr,
+#     interventional_noise,
+#     name="SI_ICP_F_TEST",
+#     trials=1000
+# ).run_and_log()
 
 
